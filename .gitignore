@@ -9,3 +9,4 @@ testVectors/multi-cell/*.yaml
 .idea/
 build*/
 cmake-build-*/
+.DS_Store
