@@ -751,7 +751,9 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 #endif
 #endif
         } else {
-
+        
+        std::cout << "Creating MPS contexts without green contexts" << std::endl;
+        
 		puschMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmPusch());
 		NVLOGC_FMT(TAG, "PUSCH MPS context with max. SM count of {}.", getMpsSmPusch());
 		mpsCtxList.push_back(puschMpsCtx);
@@ -969,9 +971,10 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     if(gpuCommDlEnabled())
         setGpuCommsCtx();
 
-    fh_proxy = std::make_unique<FhProxy>((phydriver_handle)this,ctx_cfg);
+    fh_proxy = std::make_unique<FhProxy>((phydriver_handle)this,ctx_cfg); // FhProxy constructor will register NICs with the driver
 
     for (auto nic_cfg : ctx_cfg.nic_configs) {
+        std::cout << "!!!!! Registering NIC !!!!!" << std::endl;
         if (fh_proxy->registerNic(nic_cfg, ctx_cfg.gpu_id))
             PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "NIC registration error");
     }

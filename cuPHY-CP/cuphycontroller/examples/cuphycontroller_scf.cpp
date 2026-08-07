@@ -87,6 +87,8 @@ int main(int argc,char* argv[]) {
 
     // Debug starting CPU core issue
     printf("Started cuphycontroller on CPU core %d\n", sched_getcpu());
+    //printf("Hello from MACBOOK for test\n");
+    std::cout << "Hello from MACBOOK for test with cout" << std::endl;
 
     pthread_setname_np(pthread_self(), "phy_init");
     nvlog_fmtlog_thread_init("phy_init");
@@ -449,6 +451,16 @@ int main(int argc,char* argv[]) {
             .txq_size     = nic.txq_size,
             .rxq_size     = nic.rxq_size,
         };
+
+        std::cout << "Configuring NIC: " << nic_config.nic_bus_addr << std::endl;
+        std::cout << "    NIC MTU: " << nic_config.nic_mtu << std::endl;
+        std::cout << "    CPU MBuf Num: " << nic_config.cpu_mbuf_num << std::endl;
+        std::cout << "    TX Req Num: " << nic_config.tx_req_num << std::endl;
+        std::cout << "    TXQ Count U-Plane: " << nic_config.txq_count_uplane << std::endl;
+        std::cout << "    TXQ Count C-Plane: " << nic_config.txq_count_cplane << std::endl;
+        std::cout << "    RXQ Count: " << nic_config.rxq_count << std::endl;
+        std::cout << "    TXQ Size: " << nic_config.txq_size << std::endl;
+        std::cout << "    RXQ Size: " << nic_config.rxq_size << std::endl;
 
         ctx_cfg.nic_configs.push_back(nic_config);
     }

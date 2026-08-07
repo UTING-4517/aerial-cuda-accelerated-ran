@@ -1,0 +1,3 @@
+/opt/nvidia/cuBB/testVectors/multi-cell/launch_pattern_nrSim_ULMIX_1901.yaml
+/opt/nvidia/cuBB/testVectors/multi-cell/launch_pattern_nrSim_1901.yaml
+/opt/nvidia/cuBB/testVectors/multi-cell/launch_pattern_nrSim_DLMIX_11901.yaml

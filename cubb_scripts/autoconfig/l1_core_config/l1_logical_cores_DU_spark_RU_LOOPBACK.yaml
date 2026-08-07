@@ -1,0 +1,31 @@
+---
+# DGX Spark (GB10) loopback: 20 cores, no SMT, 1 NUMA, isolated=4-19
+# Mapping rule: logical N -> cpu(N+4)
+# Fast X925 (3900MHz): cpu5-9, cpu15-19 -> logical 1-5, 11-15
+# Slow A725 (2808MHz): cpu4, cpu10-14  -> logical 0, 6-10
+
+## L1 Core Allocation (cuphycontroller)
+all_low_priority_threads: 0        # cpu4
+dpdk_thread: 1                     # cpu5
+fh_stats_dump_thread: -1           # Note: set to -1 to disable
+h2d_copy_thread: 2                 # cpu6
+ul_worker_threads: [3,4]           # cpu7,8
+dl_worker_threads: [5,11,12]       # cpu9,15,16 
+l2a_timer_thread: 6                # cpu10
+l2a_message_processing_thread: 7   # cpu11
+dl_debug_thread: -1                # Note: set to -1 to disable
+l2a_pcap_capture_thread: 0         # cpu4
+
+## Test Bench Only (testmac)
+tbonly_tm_all_low_priority_threads: 0
+tbonly_tm_schedule_thread: 8       # cpu12
+tbonly_tm_receive_thread: 9        # cpu13
+tbonly_tm_builder_thread: 10       # cpu14
+tbonly_worker_threads: []
+
+## Test Bench Only (ru_emulator)
+tbonly_re_all_low_priority_threads: 0
+tbonly_re_dpdk_thread: 13          # cpu17 
+tbonly_re_ul_threads: [14]         # cpu18
+tbonly_re_dl_threads: [15]         # cpu19
+tbonly_re_pdump_client_thread: -1  # Note: set to -1 to disable

@@ -49,6 +49,7 @@ Nic::Nic(Fronthaul* fhi, NicInfo const* info) :
     metrics_{this},
     queue_manager_{this}
 {
+    NVLOGC_FMT(TAG, "Adding NIC {}" , info_.name);
     NVLOGI_FMT(TAG, "Adding NIC {}" , info_.name);
 
     validate_input();

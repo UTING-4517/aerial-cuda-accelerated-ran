@@ -72,7 +72,7 @@ int l1_init(phydriver_handle* _pdh, const context_config& ctx_cfg)
     try
     {
         TI_GENERIC_ADD("PhyDriverCtx construct");
-        pdctx = new PhyDriverCtx(ctx_cfg);
+        pdctx = new PhyDriverCtx(ctx_cfg);          // create PhyDriverCtx object
         TI_GENERIC_ADD("PhyDriverCtx convert");
         *_pdh = StaticConversion<void>(pdctx).get();
 

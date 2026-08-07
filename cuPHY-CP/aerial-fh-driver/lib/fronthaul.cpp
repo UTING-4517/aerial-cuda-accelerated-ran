@@ -39,10 +39,12 @@ Fronthaul::Fronthaul(FronthaulInfo const* info) :
     info_{*info},
     docaParams_{}
 {
+    std::cout << "INFO: Fronthaul::Fronthaul called" << std::endl;
     NVLOGI_FMT(TAG, "Opening Fronthaul interface");
     validate_input();
     tune_virtual_memory();
 
+    // Initialize DPDK EAL and DOCA GPU if CUDA devices are specified
     if(!(info_.cuda_device_ids.empty()) || !(info_.cuda_device_ids_for_compute.empty())) {
         doca_gpu_setup();
         doca_init_logger();
@@ -228,6 +230,7 @@ void Fronthaul::eal_init()
 
 void Fronthaul::doca_gpu_setup()
 {
+    std::cout << "INFO: Fronthaul::doca_gpu_setup called" << std::endl;
 	int ret;
 
 	std::vector<std::string> args;
@@ -265,10 +268,11 @@ void Fronthaul::doca_gpu_setup()
 	for(size_t i = 0; i < argc; ++i)
 	{
 		argv[i] = (char*)args[i].c_str();
+        NVLOGC_FMT(TAG, "DPDK EAL arg #{}: {}", i, argv[i]);
 		NVLOGD_FMT(TAG, "DPDK EAL arg #{}: {}", i, argv[i]);
 	}
 
-	ret = rte_eal_init_wrapper(argc, argv.data());
+	ret = rte_eal_init_wrapper(argc, argv.data()); // initializes DPDK EAL and sets the calling thread's affinity to the specified core (info_.dpdk_thread) during initialization
 	if (ret < 0)
 		THROW_FH(ret, StringBuilder() << "DPDK init failed " << ret);
 
@@ -279,7 +283,9 @@ void Fronthaul::doca_gpu_setup()
     doca_error_t ret_doca = DOCA_SUCCESS;
 	if(!info_.cuda_device_ids.empty())
 	{
-		ret_doca = doca_gpu_create(Gpu::cuda_device_id_to_pci_bus_id(info_.cuda_device_ids[0]).c_str(), &docaParams_.gpu);
+        auto pci_bus_id = Gpu::cuda_device_id_to_pci_bus_id(info_.cuda_device_ids[0]);
+        std::cout << "INFO: Fronthaul::doca_gpu_setup: calling doca_gpu_create with cuda_device_ids[0] = " << info_.cuda_device_ids[0] << ", pci_bus_id = " << pci_bus_id << std::endl;
+		ret_doca = doca_gpu_create(pci_bus_id.c_str(), &docaParams_.gpu);
 	}
 	else if(!info_.cuda_device_ids_for_compute.empty())
 	{

@@ -73,7 +73,7 @@ FhProxy::FhProxy(
         fh_info.cuda_device_ids.clear();
     }
     
-    if(aerial_fh::open(&fh_info, &fhi))
+    if(aerial_fh::open(&fh_info, &fhi)) // fhi stores object for Fronthaul 
     {
         PHYDRIVER_THROW_EXCEPTIONS(-1, "aerial_fh::open returned error");
     }
@@ -185,10 +185,12 @@ int FhProxy::registerNic(struct nic_cfg cfg, int gpu_id)
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
 
     if(pdctx->gpuCommDlEnabled()) {
+        std::cout << "GPU Comm DL Enabled" << std::endl;
         txq_gpu = cfg.txq_count_uplane;
         txq_cpu = cfg.txq_count_cplane;
     }
     if(pdctx->cpuCommEnabled()){
+        std::cout << "CPU Comm Enabled" << std::endl;
         txq_gpu = 0;
         txq_cpu = cfg.txq_count_uplane + cfg.txq_count_cplane;
     }
