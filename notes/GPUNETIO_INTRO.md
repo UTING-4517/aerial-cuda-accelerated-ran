@@ -66,10 +66,10 @@ sched_setaffinity(0, sizeof(cpu_affinity_mask), &cpu_affinity_mask);
 
 | DPDK 主題 | 一般 DPDK 應用會碰到嗎 | 在 Aerial 的重要性 | 位置 |
 |---|---|---|---|
-| `rte_eth_rx_burst` / `tx_burst` | ✅ 一定會 | C-plane 送出還在用；**上行收包已被 GPU 取代** | `aerial-fh-driver/lib/queue.cpp:122` |
+| `rte_eth_rx_burst` / `tx_burst` | ✅ 一定會 | C-plane 送出還在用；**上行收包已被 GPU 取代** | tx `queue.cpp:122`；rx `:340, :357`（本設定不走） |
 | mbuf / mempool | ✅ 一定會 | C-plane 用；上行收包不用 | `aerial-fh-driver/lib/nic.cpp:458-533` |
-| `rte_eal_init()` + hugepage | ✅ 一定會 | 不變 | `aerial-fh-driver/lib/fronthaul.cpp:38-70` |
-| `rte_eth_dev_configure()` | ✅ 常見 | 不變 | `aerial-fh-driver/lib/nic.cpp:366-398` |
+| `rte_eal_init()` + hugepage | ✅ 一定會 | 不變 | `fronthaul.cpp:147`（wrapper），本設定由 `doca_gpu_setup()` `:275` 呼叫 |
+| `rte_eth_dev_configure()` | ✅ 一定會 | 不變 | `aerial-fh-driver/lib/nic.cpp:366-398`（呼叫在 `:390`）|
 | **`rte_flow`** | ❌ 多數應用不用 | **最高**——上行封包能不能收到全看它 | `aerial-fh-driver/lib/peer.cpp:528-693` |
 | **`rte_flow_isolate()`** | ❌ 少見 | **高**——不符規則的封包靜默消失 | `aerial-fh-driver/lib/nic.cpp:854-865` |
 | **`SEND_ON_TIMESTAMP`** | ❌ 少見 | 高——O-RAN 時序靠它 | `aerial-fh-driver/lib/nic.cpp:374-384` |
@@ -80,7 +80,7 @@ sched_setaffinity(0, sizeof(cpu_affinity_mask), &cpu_affinity_mask);
 
 ### 兩者是縫在一起的
 
-`aerial-fh-driver/lib/queue.cpp:304-325` 的 `Rxq` 建構子：
+`aerial-fh-driver/lib/queue.cpp:273-331` 的 `Rxq` 建構子（以下節錄 DOCA/DPDK 分岔的 `:304-330`）：
 
 ```cpp
 if(!(fh->get_info().cuda_device_ids.empty()) && !fh->get_info().cpu_rx_only) {
@@ -109,11 +109,24 @@ if(!(fh->get_info().cuda_device_ids.empty()) && !fh->get_info().cpu_rx_only) {
 | GPU 概念 | 是什麼 | 類比 |
 |---|---|---|
 | **thread** | 最小執行單位 | 一個 lcore 上的一次迭代 |
-| **warp** | **32 個 thread 綁在一起，鎖步執行同一條指令** | 像 SIMD lane，但每個 lane 有自己的暫存器，可以分支 |
-| **block (CTA)** | 一群 thread，可共用 shared memory、可互相同步 | 一個 lcore 的工作單位 |
-| **SM (Streaming Multiprocessor)** | 實體運算單元，一顆 GPU 有數十個 | **實體 CPU core** |
+| **warp** | **32 個 thread 一組，共用指令發射資源** | ≈ 一條 32-wide 的 SIMD 指令（對應 lane 的是單一 thread，不是 warp）|
+| **block (CTA)** | 一群 thread，可共用 shared memory、可互相同步 | 一個 lcore 的工作單位（但有兩條硬約束，見下）|
+| **grid** | 一次 launch 的所有 block | 整批工作 |
+| **SM (Streaming Multiprocessor)** | 實體運算單元，GB10 約 **48 個**（見下方註）| **實體 CPU core**（但一個 SM 能同時常駐數十個 warp）|
 
-**關鍵直覺**：同一個 warp 內的 32 個 thread 若走不同分支會「發散」（divergence），兩條路徑都要各跑一遍。所以 GPU code 會盡量讓同一個 warp 做同構的事。
+> SM 數量不是從本 repo 得到的。要確認自己機器的實際值：`nvidia-smi -q | grep -i multiprocessor`，或看 Aerial 啟動時 MPS 配額檢查的錯誤訊息——`mps.cpp:51` 的 `"...but GPU has max N SMs"` 會直接印出來。這個數字是 §3.5 判斷 `mps_sm_*` 是否超標的依據。
+
+> **block 有兩條硬約束，而它們正是本 repo 的設計前提：**
+> 1. **一個 block 只在一個 SM 上執行**，不跨 SM。所以 grid 開幾個 block，就決定了最多能用幾個 SM（見 §6① 為什麼調 `mps_sm_ul_order` 沒用）。
+> 2. **block 之間沒有執行順序保證，也不保證同時常駐**——除非 grid 小到全部能一起放進 GPU。
+>
+> 第 2 點對 order kernel 特別重要：它是 persistent kernel（`while(1)` 跑數百 µs），block 之間還會互相等待。這種寫法的正確性完全依賴「所有 block 同時 resident」。**lcore 之間可以互等（有 OS 排程救場），block 不行**——不同時 resident 就是死鎖。這是 GPU 新手最容易踩的坑。
+
+**關鍵直覺**：同一個 warp 內的 32 個 thread 若走不同分支會「發散」（divergence），兩條路徑會**序列化各跑一遍**。所以 GPU code 會盡量讓同一個 warp 做同構的事。
+
+> ⚠️ **但不要把 warp 想成「鎖步」。** Volta（compute capability 7.0）之後導入 Independent Thread Scheduling，**每個 thread 有自己的 program counter**，發散後可交錯執行，也不保證自動重新收斂。GB10 當然屬於這一代。
+>
+> 「發散有效能懲罰」仍然成立，但「warp 內天然同步」**作為正確性假設是錯的**——warp 內要交換資料一律得用 `__syncwarp()` 或 `*_sync()` 系列。本 repo 就是這樣寫的：`order_cuda_kernels.cu:3595` 用 `__shfl_sync(0xffffffff, pkt_idx, 0, 32)` 帶顯式 mask 廣播 packet index，正是因為不能假設隱含同步。
 
 本 repo 的例子：order kernel 是「**一個 warp 處理一個封包**」——32 個 thread 協作處理同一個封包的不同 PRB，天然同構。
 
@@ -122,7 +135,7 @@ if(!(fh->get_info().cuda_device_ids.empty()) && !fh->get_info().cpu_rx_only) {
 **kernel** = 一個 `__global__` 函式，由 CPU 「發射」到 GPU 執行，發射時指定用多少 block、每 block 多少 thread：
 
 ```cpp
-// cuphydriver/src/uplink/order_cuda_kernels.cu:5863
+// cuphydriver/src/uplink/order_cuda_kernels.cu:5976   ← ul_rx_pkt_tracing_level: 0 走這個分支
 order_kernel_doca_single_subSlot_pingpong<false, 0, 0, 320, 2>
     <<< cudaBlocks, ORDER_KERNEL_PINGPONG_NUM_THREADS, 0, stream >>>( ... );
 //      ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -161,6 +174,10 @@ static constexpr uint32_t UL_TASK1_ORDER_LAUNCH_OFFSET_FROM_T0_NS = 500000;
 cudaStreamCreateWithPriority(&cstream_, cudaStreamNonBlocking, -5);
 ```
 
+> ⚠️ **`-5` 是「最高優先」，不是最低。** CUDA stream priority **數字越小越優先**，跟你熟悉的 `nice`、SCHED_FIFO（數字大 = 優先，本文 §0 才剛出現過「SCHED_FIFO 95」）**方向相反**。合法範圍要用 `cudaDeviceGetStreamPriorityRange()` 查，超出會被 clamp。
+>
+> `cudaStreamNonBlocking` 的意思是「不與 legacy default stream 隱含同步」。CUDA 有一個預設的 NULL stream，預設情況下它會跟其他 stream 產生隱含同步——這是 CUDA 最常見的坑之一，這個旗標就是在關掉那個行為。
+
 把 stream 想成一條 pipeline。下行送包在一條 stream 上依序跑 memset → pre_prepare → prepare；壓縮 kernel 在另一條（cell 的 DL stream）跑。兩條之間用 **event** 同步：
 
 ```cpp
@@ -179,6 +196,11 @@ cudaStreamWaitEvent(..., comm_preprep_stop_evt, ...);
 | **pinned host memory** | CPU 直接存取，GPU 也能讀寫 | **可以** |
 
 一般 `malloc` 的記憶體 OS 可以隨時換頁（swap / 移動實體位址），網卡 DMA 不能用。要讓硬體 DMA，必須先「釘住」（pin / page-lock）。DPDK 的 hugepage mempool 就是在解決同一個問題。
+
+> ⚠️ **上表是傳統「獨立顯卡 + PCIe」的模型。你的平台不完全適用。**
+> GB10 是 Grace-Blackwell superchip，**CPU 與 GPU coherent、共用同一塊實體記憶體**，「只有 GPU 看得到」「只有 CPU 看得到」的界線比表上模糊得多。
+> 這正是後面 §9 說「接收方向換成 CPU pinned memory **不會多一次複製**」的原因——在獨立顯卡上那會是跨 PCIe 的搬移，在 GB10 上不是。
+> 先用上表建立「為什麼要 pin」的直覺就好，但別把它當成 GB10 的物理事實。
 
 DOCA 的兩種型別，在本 repo 的分岔點：
 
@@ -215,7 +237,15 @@ ulMpsCtx       = new MpsCtx(..., getMpsSmUlOrder());    // mps_sm_ul_order: 12
 gpuCommsMpsCtx = new MpsCtx(..., getMpsSmGpuComms());   // mps_sm_gpu_comms: 16
 ```
 
-**這就是 GPU 版的 CPU core 隔離。** 你在 FlexRAN 用 `isolcpus` 把核心切給不同功能、避免互搶；Aerial 用 MPS 把 SM 切給不同 channel，避免 PDSCH 的大 kernel 把收包 kernel 餓死。
+**這是 GPU 版的資源限額——但類比要小心方向。**
+
+不是 `isolcpus` 那種**互斥切分**（切給你的別人拿不到），而更像 **cgroup 的 `cpu.max` quota**：設的是**上限**，不是保留。NVIDIA MPS 文件明講：
+
+> "Setting the limit **does not reserve dedicated resources** for any MPS client context."
+
+也就是說 `mps_sm_pusch: 40` 只保證 PUSCH context **最多**用 40 個 SM，**不保證** UL order 一定拿得到它的 12 個。它防的是「單一 kernel 吃光整顆 GPU」，不是保證誰有多少。所以配額不是 SLA——PDSCH 的大 kernel 仍可能把 order kernel 排在後面。
+
+（另註：官方說 SM count 會被「internally **rounded up** to the nearest hardware supported SM count limit」，填 12 實際不一定剛好 12。）
 
 實作（`cuphydriver/src/common/mps.cpp:47-67`）：
 
@@ -232,7 +262,11 @@ cuCtxCreate_v3(&cuCtx, &affinityPrm, 1, CU_CTX_SCHED_SPIN|CU_CTX_MAP_HOST, cuDev
 
 **兩個重要釐清**：
 
-1. **檢查的是單一 context 的值，不是所有 `mps_sm_*` 的總和。** 本設定各值加起來 = 154，遠大於實體 SM 數 — 這是**正常的**，各 context 超額訂閱，由硬體排程。若啟動時 throw，是某**單一**值超過 GPU 的 SM 總數。
+1. **檢查的是單一 context 的值，不是所有 `mps_sm_*` 的總和。** 實際建立的 context 加起來遠大於實體 SM 數 — 這是**正常的**（見上：配額是上限不是保留）。若啟動時 throw，是某**單一**值超過 GPU 的 SM 總數。
+
+   > 順帶一提，yaml 的 `mps_sm_*` 與實際建立的 context **不是一對一**：
+   > - `mps_sm_pdcch` 與 `mps_sm_pbch` 不各自建 context，而是合併成 `dlCtrlMpsCtx`（`context.cpp:154, :771`）
+   > - **`mps_sm_pbch` 的 yaml 值被靜默忽略**——`context.cpp:153` 是 `mps_sm_pbch = ctx_cfg.mps_sm_pdcch;`，用的是 pdcch 的值。所以本設定的 `mps_sm_pbch: 4` 完全沒作用，`dl_ctrl` 實際是 `12 + 12 = 24`
 
 2. `mps.cpp:59` 的註解直說：SM 數合法時若 `cuCtxCreate_v3` 仍回 **CUDA error 224**，那只可能是 **MPS daemon 沒在跑**。
 
@@ -252,12 +286,12 @@ NIC 硬體比對 rte_flow 規則                                  ← 純 DPDK
     ETH(dst/src MAC, full mask) + VLAN(TCI full mask, 含 PCP)
     + eCPRI(msg type=IQ_DATA, pc_id=eAxC)
     peer.cpp:528-693
-    ↓  比中 → QUEUE action；沒比中 → rte_flow_isolate 硬體丟棄（nic.cpp:853-864）
+    ↓  比中 → QUEUE action；沒比中 → rte_flow_isolate 硬體丟棄（nic.cpp:860）
 DOCA cyclic packet buffer（DOCA_ETH_RXQ_TYPE_CYCLIC）        ← 取代 mbuf pool
     doca_obj.cpp:126, 154-197
     ↓
 GPU order kernel 呼叫 doca_gpu_dev_eth_rxq_recv()            ← 取代 rte_eth_rx_burst()
-    order_cuda_kernels.cu:3983
+    order_cuda_kernels.cu:3984
     一次最多 512 包（ul_order_max_rx_pkts）/ 100 µs 逾時
     ↓
 同一個 kernel 內，一個 warp 一個封包：
@@ -290,7 +324,7 @@ offset = flow_index * symbols_x_slot * prbs_per_symbol * prb_size   // 天線平
 | 平面 | 誰組包 | 怎麼送 |
 |---|---|---|
 | **C-plane** | CPU | `rte_eth_tx_burst()`（`queue.cpp:122`）— 完全是你熟的 DPDK |
-| **U-plane (DL IQ)** | **GPU kernel 寫 WQE** | GPU 直接構造 mlx5 的 Work Queue Entry，再「按門鈴」通知網卡 |
+| **U-plane (DL IQ)** | **GPU kernel 寫 WQE** | GPU 直接構造 mlx5 的 Work Queue Entry；**但本平台的門鈴是 CPU 敲的**，見 §9 |
 
 **WQE 與 doorbell** 是 DPDK 幫你隱藏掉的底層：`rte_eth_tx_burst()` 內部就是在做「填 WQE + 寫 doorbell 暫存器」。GPUNetIO 把這兩步搬到 GPU 上做（或部分做）。
 
@@ -306,13 +340,30 @@ if(is_gpu())
 
 ## 6. FlexRAN 直覺會誤導你的五件事
 
-### ① 「加 CPU core 就能解決收包問題」— 不適用
+### ① 「加 CPU core 就能解決收包問題」— 不適用，但也**不是調 `mps_sm_ul_order`**
 
-上行收包沒有 CPU core 參與。收包吃緊要調的是 **`mps_sm_ul_order`**（給 order kernel 更多 SM），不是核心配置。
+上行收包沒有 CPU core 參與，所以核心配置動不了它。但別急著去調 `mps_sm_ul_order` ——**那個旋鈕在本設定下已經飽和了**：
+
+- order kernel 的 grid 是 `cudaBlocks = num_order_cells`（`order_cuda_kernels.cu:5769`），kernel 內 `int cell_idx = blockIdx.x;`（`:3306`）→ **一個 cell 一個 block**
+- **一個 block 只能在一個 SM 上執行**（CUDA 硬性規則，不跨 SM）
+- 本設定 `cell_group_num: 1` → 1 個 cell → **1 個 block → 最多占 1 個 SM**
+
+`mps_sm_ul_order: 12` 遠遠超過實際需求，**調大它不會有任何效果**。
+
+真正決定 order kernel 吞吐的是：
+- **每 block 的 warp 數**：320 threads = 10 warps → 同時處理 10 個封包（一個 warp 一包）
+- **cell 數**：多 cell 才會用到多個 SM
+
+所以收包吃緊時該看的是 `[RX Packet Times]` 的 LATE 計數、`ul_order_max_rx_pkts` / `ul_order_rx_pkts_timeout_ns` 的收斂行為，以及 RU 側的送出時序——不是 SM 配額。
 
 ### ② 「DPDK 統計能告訴我收了多少包」— 不能
 
-`rte_eth_stats_get()` / `xstats` 的 RX 計數反映的是 DPDK 自己管理的 queue。U-plane queue 是 DOCA 建的、GPU 消費的，**DPDK 那套統計看不到**。
+要分清楚兩種計數：
+
+- **`rte_eth_stats_get()` 與 per-queue 計數**：mlx5 是把各個 PMD rxq 的**軟體**計數加總。external RxQ 沒有 PMD 的 rxq 控制結構，所以**看不到** GPU queue 的封包。
+- **`rte_eth_xstats_get()`**：裡面有 **device 層級的硬體計數器**（`rx_vport_unicast_packets` 等），這些是網卡自己數的，**會**把 GPU queue 的封包算進去。
+
+所以「DPDK 完全看不到」是不準確的說法——**軟體 per-queue 計數看不到，硬體計數器看得到**。這也是 [`DPDK_ADVANCED.md`](DPDK_ADVANCED.md) §5 那個檢查順序第 2 步能成立的原因。
 
 要看實際收包狀況，看 order kernel 自己維護的計數：
 
@@ -344,9 +395,26 @@ if(is_gpu())
 - **SM 爭用** → 所以有 MPS 配額
 - **kernel 逾時** → `ul_order_timeout_gpu_ns: 3000000`（3 ms）
 
-### ⑤ 「gdb / perf 能看到問題」— 工具換了
+### ⑤ 「API 回錯誤碼我就知道出事了」— CUDA 錯誤是**非同步**的
 
-見第 7 節。
+這是 DPDK 背景的人最大的認知落差，也最會實際害到你。
+
+DPDK 每個 API 當場回傳錯誤碼。CUDA 不是：
+
+- **kernel launch 立刻回傳**，不等它跑完。kernel 內部出的錯要到**下一個同步點**（`cudaStreamSynchronize`、`cudaMemcpy`、event query…）才浮出來
+- 因此錯誤常常被歸咎到一個**毫不相干的後續 API 呼叫**上
+- **kernel 內沒有例外機制**。陣列越界不會 segfault，就是安靜地寫壞別人的記憶體
+
+實務上：
+- `cudaGetLastError()` 在 launch 之後立刻呼叫，抓 launch 參數錯誤（如 block size 超限）
+- 除錯時設環境變數 `CUDA_LAUNCH_BLOCKING=1` 強制同步，錯誤才會出現在正確的位置
+- 記憶體錯誤用 `compute-sanitizer`（GPU 版的 valgrind/ASAN，舊名 `cuda-memcheck`）
+
+這一點跟 §6③-2 是同一件事的兩面：`get_eaxc_index()` 查不到回傳 0，封包被寫進天線 0 的位置——**不會有任何錯誤，只有結果不對**。
+
+### ⑥ 「gdb / perf 能看到問題」— 工具換了
+
+見第 7 節。特別注意：`cuda-gdb` 對這種 persistent kernel + 500 µs 死線的即時系統幾乎不能用——設中斷點等於把整條 pipeline 打死。實務上只能靠 Nsight Systems 的時間軸加上 kernel 自己維護的計數器。
 
 ---
 
@@ -356,7 +424,8 @@ if(is_gpu())
 |---|---|---|
 | `perf` / `top` | **Nsight Systems**（`nsys`） | 時間軸：kernel 何時跑、跑多久、誰在等誰 |
 | `perf annotate` | **Nsight Compute**（`ncu`） | 單一 kernel 內部的瓶頸分析 |
-| `gdb` | **`cuda-gdb`** | 進 kernel 設中斷點 |
+| `gdb` | **`cuda-gdb`** | 進 kernel 設中斷點。**對本專案幾乎不能用**——persistent kernel + 500 µs 死線，斷點=打死 pipeline |
+| `valgrind` / ASAN | **`compute-sanitizer`** | 抓越界、race、未初始化。舊名 `cuda-memcheck`。在「查不到就寫進天線 0」這種程式裡特別值得跑 |
 | `printf` 除錯 | kernel 內 `printf()` | **可用但嚴重影響時序** — 這就是 Aerial 的 `printf` 幾乎都在錯誤路徑上的原因 |
 | `rte_eth_stats_get()` | order kernel 的計數 + 網卡硬體計數器 | 見 6-② |
 
@@ -375,6 +444,9 @@ if(is_gpu())
 | **event** | stream 之間的同步點 |
 | **device / host memory** | GPU 記憶體 / CPU 記憶體 |
 | **pinned memory** | 被釘住不會換頁的 host 記憶體，可被硬體 DMA |
+| **shared memory** | block 內所有 thread 共用的高速 scratchpad，位於 SM 上，比 global memory 快一個量級 |
+| **register** | thread 私有的最快儲存 |
+| **grid** | 一次 launch 的所有 block 的總稱 |
 | **H2D / D2H** | Host-to-Device / Device-to-Host 複製 |
 | **GPUDirect RDMA** | 網卡直接 DMA 進 GPU 記憶體，不經主記憶體 |
 | **MPS** | Multi-Process Service，讓多 context 並行並可限制 SM 數 |

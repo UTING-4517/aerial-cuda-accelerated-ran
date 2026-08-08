@@ -184,7 +184,7 @@ if(!flow && std::string(err.message).find("eCPRI") != std::string::npos)
 |---|---|
 | 加 `COUNT` action | 在規則裡加 `RTE_FLOW_ACTION_TYPE_COUNT`，用 `rte_flow_query()` 讀命中次數。**確認規則有沒有被比中的最直接方法** |
 | `validate` 的錯誤訊息 | `rte_flow_validate()` 失敗時 `err.message` 會說明是哪個 item/action 不支援 |
-| 網卡硬體計數器 | `ethtool -S <iface>` 看 `rx_packets` vs DPDK 看到的數量。硬體收到但 DPDK 沒收到 = 規則沒比中或被 isolate 丟掉 |
+| 網卡硬體計數器 | `ethtool -S <iface>` 看 `rx_packets`，或 `rte_eth_xstats_get()` 讀 mlx5 的 device 層級計數（`rx_vport_unicast_packets` 等）。⚠️ 注意 `rte_eth_stats_get()` 與 per-queue 計數是 PMD **軟體**計數，看不到 GPUNetIO 的 external RxQ；**device 層級的硬體計數器看得到**。硬體收到但應用沒收到 = 規則沒比中或被 isolate 丟掉 |
 | `tcpdump` | 注意：DPDK 綁定的介面通常看不到，需要 `dpdk-pdump` 或先用核心驅動測 |
 | Aerial 的 log | `flow.cpp:247` / `peer.cpp` 的 `Setting up flow rules for ... [Destination MAC: ...][VLAN Tci: ...][eCPRI eAxC ID: ...]`，可逐欄核對實際裝上去的值 |
 
@@ -312,7 +312,7 @@ Aerial 有把這些匯出成 Prometheus metric（`metrics.cpp:68-91`、`nic.cpp:
 
 「Poll Mode」是相對於傳統中斷模式——DPDK 不用中斷，靠 CPU 主動輪詢 descriptor ring，省掉中斷開銷與 context switch。你呼叫 `rte_eth_rx_burst()` 時，底下就是 PMD 在讀網卡的 ring。
 
-`mlx5` 是 NVIDIA/Mellanox **ConnectX-5 以後**（含 CX-6、CX-7、BlueField）的 PMD。本機的整合式 CX-7 走的就是它。
+`mlx5` 是 NVIDIA/Mellanox **ConnectX-4 以後**（CX-4/4Lx/5/6/6Dx/7/8 與 BlueField）的 PMD。本機的整合式 CX-7 走的就是它。（更早的 ConnectX-3 走 `mlx4`。）
 
 ### 3.2 devargs：探測階段傳給驅動的參數
 
