@@ -49,8 +49,10 @@ sched_setaffinity(0, sizeof(cpu_affinity_mask), &cpu_affinity_mask);
 
 | 做法 | 資料路徑 |
 |---|---|
-| 傳統 | NIC → 主記憶體(mbuf) → CPU 解析 → **複製到 GPU** → GPU 運算 |
-| GPUNetIO | NIC → **GPU 可直接讀的記憶體** → GPU 解析 → GPU 運算（同一塊記憶體） |
+| 傳統 | NIC → 主記憶體(mbuf) → CPU 解析 → **複製到 GPU** → GPU IQ tensor → GPU 運算 |
+| GPUNetIO | NIC → **GPU 可直接讀的 DOCA packet buffer** → GPU 解析／解壓縮 → cuPHY IQ tensor → GPU 運算；**無 CPU staging、無 H2D copy** |
+
+> ⚠️ **「GPU 可直接讀」不等於「全程同一塊記憶體」。** 這裡有兩塊不同的 buffer：NIC 寫入的 DOCA cyclic packet buffer（`order_cuda_kernels.cu:3608` 用 `doca_gpu_dev_eth_rxq_get_pkt_addr()` 取址），以及 order kernel 解壓縮後寫入的 PUSCH/PRACH/SRS IQ tensor（`:3735-3766` 選 buffer、`:3782-3795` 寫入）。省掉的是 **CPU 解析、CPU staging 與 H2D copy**，不是「完全沒有資料搬移」。
 
 省下的不只是那次複製。**更重要的是省掉 CPU 逐包解析 O-RAN header 的工作**：4 個 eAxC × 14 symbol，每 slot 數百個封包，每包都要拆 header、查 eAxC 表、算落點、BFP 解壓縮。CPU 做這個會吃掉整個 slot 預算。
 
@@ -58,9 +60,11 @@ sched_setaffinity(0, sizeof(cpu_affinity_mask), &cpu_affinity_mask);
 
 ## 2. DPDK 那一半：什麼還在、什麼要補
 
-**GPUNetIO 沒有取代 DPDK，它只接管了資料面。控制面全部還是 DPDK。**
+**GPUNetIO 沒有取代 DPDK。** O-RAN C-plane 封包仍由 CPU/DPDK 收送，DPDK 也繼續負責 EAL、port 設定、`rte_flow` 與 flow isolation。
 
-被換掉的**只有**：上行 U-plane 的 `rte_eth_rx_burst()`，以及下行 U-plane 的送出。其餘都還是 DPDK。
+被換掉的是：上行 U-plane 的 `rte_eth_rx_burst()`，以及下行 U-plane 的送出。
+
+> ⚠️ **但別把它讀成「控制面全部還是 DPDK」。** 這句話只在「控制面」專指 O-RAN C-plane 封包時才成立。GPU queue 的**建立**本身也是 control path，而那是 DOCA 做的：TX 分支呼叫 `doca_create_tx_queue()` 並跳過 `rte_eth_tx_queue_setup()`（`queue.cpp:75-97`），RX 分支呼叫 `doca_create_rx_queue()` 並跳過 `rte_eth_rx_queue_setup()`（`:304-330`）。Aerial 用的是 **DPDK + DOCA 混合的 control path**，GPU kernel 只負責 U-plane data path。
 
 但「還是 DPDK」不代表「你一定用過」。O-RAN fronthaul 用到的 DPDK 功能比一般應用多：
 
@@ -120,7 +124,13 @@ if(!(fh->get_info().cuda_device_ids.empty()) && !fh->get_info().cpu_rx_only) {
 > 1. **一個 block 只在一個 SM 上執行**，不跨 SM。所以 grid 開幾個 block，就決定了最多能用幾個 SM（見 §6① 為什麼調 `mps_sm_ul_order` 沒用）。
 > 2. **block 之間沒有執行順序保證，也不保證同時常駐**——除非 grid 小到全部能一起放進 GPU。
 >
-> 第 2 點對 order kernel 特別重要：它是 persistent kernel（`while(1)` 跑數百 µs），block 之間還會互相等待。這種寫法的正確性完全依賴「所有 block 同時 resident」。**lcore 之間可以互等（有 OS 排程救場），block 不行**——不同時 resident 就是死鎖。這是 GPU 新手最容易踩的坑。
+> 第 2 點的推論是：**跨 block 的 busy-wait / barrier 很危險**。**lcore 之間可以互等（有 OS 排程救場），block 不行**——不同時 resident 就是死鎖。這是 GPU 新手最容易踩的坑。
+>
+> **但本設定啟用的 order kernel 沒有踩這個坑。** `ul_order_kernel_mode: 0`（yaml `:47`）走 ping-pong mode，程式碼註解寫得很清楚：「The ping-pong order kernels use a single CTA to both receive and process the packets」（`order_cuda_kernels.cu:37-38`）。一個 cell 一個 CTA，收包與處理都在同一個 block 內完成，**不依賴其他 cell 的 block 同時 resident**——kernel 本體（`:3204-4092`）內只有 block 內的 `__threadfence_block()`，沒有任何跨 block 同步。
+>
+> 同一個 `.cu` 檔裡確實有用 `barrier_signal = gridDim.x` 做跨 block barrier 的舊 kernel（`:270`、`:6978`、`:7200`），但那些不是本設定走的分支。**讀 `order_cuda_kernels.cu` 時務必先確認自己看的是哪個 mode。**
+>
+> 反過來說，`:3199-3202` 的 `__launch_bounds__` 註解正好說明設計上**預期** CTA 可能被延後 launch：「寧願兩個 CTA 擠在一個 SM 上，也不要延後其中一個 CTA」——如果真的依賴同時 resident，就不會這樣寫。
 
 **關鍵直覺**：同一個 warp 內的 32 個 thread 若走不同分支會「發散」（divergence），兩條路徑會**序列化各跑一遍**。所以 GPU code 會盡量讓同一個 warp 做同構的事。
 
@@ -144,7 +154,7 @@ order_kernel_doca_single_subSlot_pingpong<false, 0, 0, 320, 2>
 
 `<<< >>>` 是 CUDA 特有語法。本設定是 **每個 cell 一個 block、每 block 320 threads（= 10 warps）**（`cudaBlocks = num_order_cells`，`:5769`）。
 
-> ⚠️ `:5769` 的註解 `//# of Thread blocks should be twice the number of cells` 是**過期註解**，程式碼實際是 `int cudaBlocks = (num_order_cells);`。
+> ⚠️ `:5769` 的註解 `//# of Thread blocks should be twice the number of cells` 描述的**不是這個 mode**。它講的是 `ul_order_kernel_mode: 1`（Dual CTA mode，「block 0 to receive, block 1 to process」），那個分支在 `:6015` 確實用 `cudaBlocks * 2`。註解被放在兩個 mode 共用的變數宣告上，很容易誤讀成本 mode 的行為。
 
 **對 DPDK 使用者最違反直覺的地方**：這個 kernel 不是「處理一批就結束」。它裡面有 `while(1)` 迴圈，**持續執行數百微秒**，一邊收包一邊處理，直到收滿預期 PRB 數或逾時才退出。
 
