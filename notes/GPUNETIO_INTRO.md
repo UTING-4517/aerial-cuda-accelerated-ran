@@ -198,7 +198,9 @@ cudaStreamWaitEvent(..., comm_preprep_stop_evt, ...);
 一般 `malloc` 的記憶體 OS 可以隨時換頁（swap / 移動實體位址），網卡 DMA 不能用。要讓硬體 DMA，必須先「釘住」（pin / page-lock）。DPDK 的 hugepage mempool 就是在解決同一個問題。
 
 > ⚠️ **上表是傳統「獨立顯卡 + PCIe」的模型。你的平台不完全適用。**
-> GB10 是 Grace-Blackwell superchip，**CPU 與 GPU coherent、共用同一塊實體記憶體**，「只有 GPU 看得到」「只有 CPU 看得到」的界線比表上模糊得多。
+> GB10 是 Grace-Blackwell superchip，**CPU 與 GPU 共用同一組實體 LPDDR5X**，沒有傳統獨立顯卡的專屬 VRAM。
+>
+> 但**別因此推論「反正都一樣」**：allocation type 仍然決定 CPU、GPU、NIC 三方各自的合法存取方式。device allocator 拿到的記憶體不會因為實體共享就自動變成 NIC 可 coherent 存取——這正是 Spark 不支援 GPUDirect RDMA 的原因（見 §9）。
 > 這正是後面 §9 說「接收方向換成 CPU pinned memory **不會多一次複製**」的原因——在獨立顯卡上那會是跨 PCIe 的搬移，在 GB10 上不是。
 > 先用上表建立「為什麼要 pin」的直覺就好，但別把它當成 GB10 的物理事實。
 
@@ -257,7 +259,7 @@ if (actualDevSmCount < devSmCount) {                                            
 CUexecAffinityParam affinityPrm;
 affinityPrm.type = CU_EXEC_AFFINITY_TYPE_SM_COUNT;                              // :58
 affinityPrm.param.smCount.val = devSmCount;                                     // :59
-cuCtxCreate_v3(&cuCtx, &affinityPrm, 1, CU_CTX_SCHED_SPIN|CU_CTX_MAP_HOST, cuDev); // :67
+cuCtxCreate_v3(&cuCtx, &affinityPrm, 1, CU_CTX_SCHED_SPIN|CU_CTX_MAP_HOST, cuDev); // :67  ← CUDA<13 分支
 ```
 
 **兩個重要釐清**：
@@ -268,7 +270,9 @@ cuCtxCreate_v3(&cuCtx, &affinityPrm, 1, CU_CTX_SCHED_SPIN|CU_CTX_MAP_HOST, cuDev
    > - `mps_sm_pdcch` 與 `mps_sm_pbch` 不各自建 context，而是合併成 `dlCtrlMpsCtx`（`context.cpp:154, :771`）
    > - **`mps_sm_pbch` 的 yaml 值被靜默忽略**——`context.cpp:153` 是 `mps_sm_pbch = ctx_cfg.mps_sm_pdcch;`，用的是 pdcch 的值。所以本設定的 `mps_sm_pbch: 4` 完全沒作用，`dl_ctrl` 實際是 `12 + 12 = 24`
 
-2. `mps.cpp:59` 的註解直說：SM 數合法時若 `cuCtxCreate_v3` 仍回 **CUDA error 224**，那只可能是 **MPS daemon 沒在跑**。
+2. `mps.cpp:59` 的註解直說：SM 數合法時若建 context 仍回 **CUDA error 224**，那只可能是 **MPS daemon 沒在跑**。
+
+3. **實際呼叫的 API 依 CUDA 版本而定**：上面貼的 `cuCtxCreate_v3` 是 `CUDA_VERSION < 13000` 的分支。本專案 container 基底是 `cuda:13.1.1`（`cuPHY-CP/container/aerial_base_recipe.py:38`），所以實際走 `CUctxCreateParams` + **`cuCtxCreate()`**（`mps.cpp:56-68`）。`mps.cpp:52` 的例外訊息字串仍寫死 `cuCtxCreate_v3()`，那是沒同步更新的訊息。
 
 **哪個旋鈕管哪個 kernel**（常見誤解）：
 - 上行收包 order kernel → **`mps_sm_ul_order`**

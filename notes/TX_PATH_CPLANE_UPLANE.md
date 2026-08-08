@@ -4,6 +4,8 @@
 
 關鍵旗標：`gpu_init_comms_dl: 1`、`gpu_init_comms_via_cpu: 1`、`cpu_init_comms: 0`、`mMIMO_enable: 0`、`cell_group_num: 1`、`disable_empw: 0`、`ru_type: 1`(SINGLE_SECT_MODE)
 
+> **單 cell 前提**：yaml 雖然保留 8 組 cell 定義（`:138-548`），但 `cell_group_num: 1` 使初始化 loop 在成功加入第一個 cell 後就 `break`（`cuphydriver_api.cpp:118-128`）。本文所有 queue 數量、beta 值與 runtime 路徑推導**都以這個單 cell 有效組態為準**。
+
 > 本文所有行號都經過實際讀取原始碼確認。無法從本 repo 確認的內容集中在最後一節「未確認事項」，不混在正文裡。
 
 > **路徑慣例**：文中所有 `檔案:行號` 都是**相對於 repo 根目錄**（本文件位於 `notes/`，往上一層）。
@@ -21,7 +23,10 @@
 | C-plane | DU→RU | CPU | `rte_eth_tx_burst`（`queue.cpp:122`） | CPU DPDK TXQ × **2** |
 | U-plane | DU→RU（DL IQ） | GPU kernel | GPU 寫 WQE + **CPU proxy 敲 doorbell** | DOCA GPU TXQ × **1** |
 | U-plane | RU→DU（UL IQ） | GPU kernel 直接收 | `doca_gpu_dev_eth_rxq_recv` | DOCA GPU RxQ × **2**（含 SRS） |
-| C-plane | RU→DU | — | **不存在**，DU 不收 C-plane | — |
+| C-plane | RU→DU | — | 本組態沒有受支援的 C-plane RX / processing path（見下） | — |
+
+> **本組態沒有受支援的 RU→DU C-plane processing path。** cuphydriver 建 Peer 時固定用 `RxApiMode::PEER`（`fh.cpp:294`）；eCPRI parser 正常可用時，PEER mode 的 RX flow rule 只匹配 `RTE_ECPRI_MSG_TYPE_IQ_DATA`（`peer.cpp:575-643`）。若 NIC 不支援 eCPRI parser，程式會移除 eCPRI pattern 後重試（`peer.cpp:609-613`），此時相同 MAC / VLAN 的 C-plane frame 在 flow-steering 層可能進入 RXQ，但 cuphydriver 仍沒有對應的 C-plane receive / processing API，不能把這個 fallback 視為受支援的 C-plane 路徑。
+> FH driver 本身**有**這個能力：`RxApiMode::HYBRID`（`api.hpp:336-343`）會走 `peer.cpp:695-824` 建立匹配 `RTE_ECPRI_MSG_TYPE_RTC_CTRL` 的規則。loopback 測試時的 `ru_emulator` 用的就是 HYBRID。
 
 分工的決定點只有一處，`cuPHY-CP/cuphydriver/src/common/fh.cpp:186-198`：
 
@@ -36,7 +41,10 @@ if(pdctx->cpuCommEnabled()){           // cpu_init_comms: 0（未啟用）
 }
 ```
 
-隔離是強制的：`Txq::send()` 一旦發現自己是 GPU queue 就直接 `THROW_FH(ENOTSUP, ...)`（`queue.cpp:114-117`）。CPU 在程式碼層面不可能從 GPU queue 送包，反之亦然。
+兩條路徑在資源配置上是隔離的，但保護機制**不對稱**：
+
+- **CPU 側有顯式 runtime guard**：`Txq::send()` / `send_lock()` 一旦發現自己是 GPU queue 就直接 `THROW_FH(ENOTSUP, ...)`（`queue.cpp:114-117, 139-152, 174-187`）
+- **GPU 側靠資源分派保證**：`Peer::request_nic_resources()` 用 `assign_txq(true)` 從**獨立的 GPU free list** 取得 DOCA queue handle（`queue_manager.cpp:31-40, 56-79`），程式中沒有對稱的「GPU 誤用 CPU queue」檢查
 
 ---
 
@@ -92,16 +100,18 @@ if (ctx_cfg.enable_srs) rxq_count += ctx_cfg.cell_group_num;    // :439-441
 
 **注意順序**：CPU TXQ 在 `rte_eth_dev_start()` **之前**（DPDK 規定），GPU TXQ 在**之後**。`configure()` 已把 CPU+GPU 的總數一次宣告給 port，所以 GPU 佔用的 queue index 是預留好的。
 
-GPU TXQ 不走 DPDK ethdev，而是 `doca_create_tx_queue`（`queue.cpp:80/84` → `doca_obj.cpp:601-697`）自建 SQ 並自行 `doca_ctx_start`（`doca_obj.cpp:684`）。
+GPU TXQ 的 **queue setup 與資料提交**不走 `rte_eth_tx_queue_setup()` / `rte_eth_tx_burst()`，而是 `doca_create_tx_queue`（`queue.cpp:80/84` → `doca_obj.cpp:601-697`）自建 SQ 並自行 `doca_ctx_start`（`doca_obj.cpp:684`），送出改由 GPU 寫 WQE。
+
+> 但**同一個 port 仍然由 DPDK ethdev 管理**：CPU+GPU 的 TXQ 總數在 `rte_eth_dev_configure()` 一起宣告（`nic.cpp:366-390`）、`rte_eth_dev_start()` 啟動整個 port（`nic.cpp:1067-1092`）、MTU / offload / `rte_flow_isolate` / flow steering 也全是 DPDK。「不走 ethdev」僅限 queue setup 與資料路徑這兩件事。
 
 ### 1.3 TX 側資源配置
 
 | 資源 | 函式 | 大小 | 記憶體位置 |
 |---|---|---|---|
-| CPU mbuf pool | `nic.cpp:458-533` | `rte_align32pow2(196608)-1` = **262143** 個 × **1664 B** droom | hugepage 主記憶體 |
+| CPU mbuf pool | `nic.cpp:458-533` | `rte_align32pow2(196608)-1` = **262143** 個，每個 **data room 1664 B**（不含 `rte_mbuf` 本身、priv/shinfo 與 mempool metadata，實際單物件更大）| hugepage 主記憶體 |
 | U-plane TX request | `nic.cpp:558-574` | `rte_align32pow2(64)-1` = **63** 個 `TxRequestUplane` | hugepage |
 | C-plane TX request | `nic.cpp:576-592` | **63** 個 `TxRequestCplane` | hugepage |
-| GPU 封包緩衝 | `nic.cpp:983-1003` → `doca_obj.cpp:454-598` | `API_MAX_NUM_CELLS × MAX_DL_EAXCIDS × 2048` 包 × 2048 B | **GPU VRAM**（via_cpu 時另配一份 CPU-visible 副本） |
+| GPU 封包緩衝 | `nic.cpp:983-1003` → `doca_obj.cpp:454-598` | `API_MAX_NUM_CELLS × MAX_DL_EAXCIDS × 2048` 包 × 2048 B | `DOCA_GPU_MEM_TYPE_GPU` allocation（GPU-only addressable；via_cpu 時另配一份 CPU pinned 副本）|
 
 droom 計算：`RTE_ALIGN_MUL_CEIL(1500 + 128 + 14 + 4, 128)` = 1664（`nic.cpp:460`，`kMbufPoolDroomSzAlign=128` 在 `defaults.hpp:28`）
 
@@ -171,10 +181,21 @@ Worker task
 
 | | 註冊位置 | task 名 | 執行時間 |
 |---|---|---|---|
-| DL | `cuphydriver_api.cpp:1820` | `TaskDL1AggrCplane<N>` | `tick_original`（**slot 邊界當下**，`:1582, 1661-1662`） |
+| DL | `cuphydriver_api.cpp:1820` | `TaskDL1AggrCplane<N>` | `tick_original`（`:1582, 1661-1662`）|
 | UL | `cuphydriver_api.cpp:1402` | `TaskUL1AggrCplane<N>` | `tick_original + 1×TTI`（μ=1 → **+500 µs**，`:1271, 1287`） |
 
 UL task 因為排在一個 slot 之後，內部用 `exec_slot_ahead = getSlotAhead() - 1` 扣回來（`task_function_ul_aggr.cpp:1397-1398`，該處有註解說明）。
+
+> ⚠️ **`tick_original` 不是目標空中 slot 的 T0。** 收到 slot command 後它會被校正（`cuphydriver_api.cpp:447-468`）：
+>
+> ```cpp
+> uint64_t t0_slot      = sfn_to_tai(sfn, slot, ...);                    // 目標空中 slot 的 T0
+> uint64_t correct_tick = t0_slot - (min_slot_ahead * TTI);              // :450
+> if (correct_tick != sc->tick_original.count())
+>     sc->tick_original = t_ns(correct_tick);                            // :465
+> ```
+>
+> 所以 `tick_original` 的正確語意是「**目標 T0 之前 `min_slot_ahead` 個 TTI 的 scheduler reference boundary**」，不是 slot 邊界當下。談 DL 時間軸時差的是整整幾個 slot，別搞混。
 
 ### 2.3 封包組裝（`Peer::prepare_cplane_message`，`peer.cpp:2878-3390`）
 
@@ -234,7 +255,7 @@ uint16_t section_id_prach = start_section_id_prach; // [2048, 3072)  PRACH
 > DL C-plane 走同一個 `prepareCPlaneInfo`，但因 `direction == DIRECTION_DOWNLINK` 被短路跳過——**DL 的 sectionId 撞進 PRACH/SRS 區段不會有任何 log**。
 > 另外三個子條件裡也沒有 `section_id_srs` 的上界檢查（`< 4096`），所以 `[3072, 4096)` 的上界在程式碼層面是無保護的。
 >
-> 順帶一提，這三個範圍**完全由 yaml 決定**（`start_section_id_prach` / `start_section_id_srs`），不是程式碼寫死的常數；12-bit 的上限來自 `oran.hpp:735` 的 `Bitfield<uint32_t,·,12> sectionId`。
+> 順帶一提，這三個範圍**只有分界起點由 yaml 決定**（`start_section_id_prach` / `start_section_id_srs`）。一般 section 從 **0** 起算是程式碼固定的（`fh.cpp:1372`），而 4096 的上限來自協定欄位寬度——`oran.hpp:735` 的 `Bitfield<uint32_t,·,12> sectionId` 是 12-bit。
 
 > 這正是上行接收端 order kernel 用來分辨 PUSCH / PRACH 的依據——收端沒有其他區分方式。
 
@@ -261,7 +282,9 @@ start_tx = getTaskTsExec(0) + TTI_ns(mu) * (slotAhead - 1) - T1a_max_cp_ul_ns;
 `getTaskTsExec(0)` 本身含 +1 slot，兩者抵消 → `start_tx = 空中 slot 起點 − 392 µs`。**`T1a_max_cp_ul_ns` 是直接消費點。**
 
 **逐 symbol 推進**（`fh.cpp:1369-1370, 2205-2206, 2528-2529`）：每 symbol 推進 `SYMBOL_DURATION_NS = 35714`（`doca_structs.hpp:33`）。
-`ru_type: 1` = SINGLE_SECT_MODE 時 DL 只送一個 symbol 的 C-plane 就 `break`（`fh.cpp:2531-2534`）。
+`ru_type: 1` = SINGLE_SECT_MODE 時，DL 的 symbol loop **只跑一次就 `break`**（`fh.cpp:2531-2534`）。
+
+> ⚠️ 這**不等於**「section 只涵蓋一個 OFDM symbol」。每個 section 的 `numSymbol` 仍取自 L2 給的值（`fh.cpp:2250` `section_info.numSymbol = prb_info.common.numSymbols;`），可以大於 1。`break` 的實際效果是**只產生一組以單一 `startSymbolId` 為起點的 message set**，而不是強制 `numSymbol == 1`。
 
 **時間戳寫入 mbuf**（`peer.cpp:2908, 2953-2958`）：
 
@@ -274,7 +297,13 @@ if(info.tx_window.tx_window_start > last_packet_ts) {
 }
 ```
 
-只給每個 message 的**第一個 mbuf** 打時間戳；`last_*_cplane_tx_ts_` 是 Peer 成員（`peer.hpp:668-669`），確保單調不倒退。其餘 mbuf 顯式清 `ol_flags = 0`（`peer.cpp:2896, 2927`）。
+時間戳的粒度是「**每個新的、遞增的 `tx_window_start` 群組的第一包**」，不是每個 message 都有：
+
+- 同一個 symbol 內的所有 channel / flow message **共用同一個 `tx_window_start`**——它在 symbol loop 開頭就設好了（`fh.cpp:2205`），內層才是 channel_type 與 flow 的迴圈
+- 配合 `if(tx_window_start > last_packet_ts)` 的嚴格大於條件，同一 symbol 的第二個以後的 message **不會再設時間戳**
+- 一個 message 若被切成多個 mbuf，也只有該 message 的第一個 mbuf 可能帶時間戳
+
+`last_dl_cplane_tx_ts_` / `last_ul_cplane_tx_ts_` 是 **Peer 層級、分方向**的成員（`peer.hpp:668-669`），確保同方向單調不倒退。其餘 mbuf 顯式清 `ol_flags = 0`（`peer.cpp:2896, 2927`）。有 section extension 時走另一份等價程式碼（`peer.cpp:3381-3386`），條件相同。
 
 dynfield/dynflag 註冊在 `Fronthaul::setup_accurate_send_scheduling()`（`fronthaul.cpp:345-378`）。
 
@@ -308,7 +337,9 @@ if((start_tx_time.count() - time_now.count()) < sendCPlane_timing_error_th_ns)  
 
 ## Part 3：U-plane 下行發送（GPU / DOCA GPUNetIO 路徑）
 
-### 3.1 每個 DL slot 的 task 序列
+### 3.1 每個 DL slot 的 task 註冊順序與執行依賴
+
+> ⚠️ **下表是 task 物件的建立／排入順序，不是嚴格的串行時間線。** 各 task 用幾乎相同的基準時間、只差 `task_index` 奈秒（`cuphydriver_api.cpp:1661-1663`），而且可能分派到不同 worker 並行執行。真正的先後由執行期同步保證，例如 GPU Comm TX 等所有 U-plane prepare 完成（`task_function_dl_aggr.cpp:2581-2584`）、CPU doorbell task 等壓縮結束（`:2040-2044`）。C-plane task 則可能與部分 GPU 工作並行。
 
 完整的 DL task 註冊順序（`cuphydriver_api.cpp`）：
 
@@ -330,7 +361,10 @@ if((start_tx_time.count() - time_now.count()) < sendCPlane_timing_error_th_ns)  
 
 兩條 stream 在 `GpuComm` 建構時建立，而 `GpuComm` 建於 `Nic` 建構中（`nic.cpp:92`），此時 current context 已切成 GPU-comms MPS context（`context.cpp:971-980`）。
 
-`mps_sm_gpu_comms: 16` → `gpuCommsMpsCtx = new MpsCtx(..., getMpsSmGpuComms())`（`context.cpp:797`，gate 在 `:795`），透過 `cuCtxCreate_v3` + `CU_EXEC_AFFINITY_TYPE_SM_COUNT`（`mps.cpp:58-67`）。
+`mps_sm_gpu_comms: 16` → `gpuCommsMpsCtx = new MpsCtx(..., getMpsSmGpuComms())`（`context.cpp:797`，gate 在 `:795`），透過 `CU_EXEC_AFFINITY_TYPE_SM_COUNT` 建立具 SM affinity 的 CUDA context（`mps.cpp:56-68`）。
+
+> 實際呼叫哪個 API 取決於 CUDA 版本（`mps.cpp` 的條件編譯）：本專案 container 基底是 `nvcr.io/nvidia/cuda:13.1.1-devel-ubuntu22.04`（`cuPHY-CP/container/aerial_base_recipe.py:38`），`CUDA_VERSION >= 13000` 成立 → 走 **`CUctxCreateParams` + `cuCtxCreate()`**；`cuCtxCreate_v3()` 是 CUDA 13 以前的分支。
+> 注意 `mps.cpp:52` 的例外訊息字串仍寫死 `cuCtxCreate_v3()`，那是沒同步更新的訊息，不代表實際呼叫的 API。
 
 **涵蓋**：`gpu_comm_doca.cu` 裡跑在這兩條 stream 上的全部 kernel。
 **不涵蓋**：`kernel_compress` — 它跑在 cell 的 DL stream，context 是 `dlMpsCtx = pdschMpsCtx`（`context.cpp:782`），吃 **`mps_sm_pdsch: 46`**。
@@ -439,7 +473,7 @@ cuphydriver_api.cpp:1852-1866   只有 gpuCommEnabledViaCpu() 才排 "TaskDL2Rin
 |---|---|---|
 | TXQ SQ 記憶體 | `DOCA_GPU_MEM_TYPE_GPU` | `DOCA_GPU_MEM_TYPE_CPU_GPU`（`queue.cpp:78-85`） |
 | UAR（doorbell 暫存器） | GPU 側 | **`doca_eth_txq_gpu_set_uar_on_cpu()`**（`doca_obj.cpp:633`） |
-| 封包緩衝 | 一份 GPU VRAM | GPU 一份 + CPU-visible 一份（`cpu_comms_*`，`doca_obj.cpp:549-595`），各有 mkey |
+| 封包緩衝 | 一份 `MEM_TYPE_GPU`（GPU-only addressable）| GPU 一份 + CPU pinned 一份（`cpu_comms_*`，`doca_obj.cpp:549-595`），各有 mkey |
 | WQE 指向 | GPU buffer | **CPU buffer**（`hdr_addr_tx`，`gpu_comm_doca.cu:319-321`） |
 | 壓縮 kernel 寫入 | GPU buffer | GPU buffer（`hdr_addr`，`:435`）|
 | doorbell | GPU trigger kernel | **CPU proxy_progress** |
@@ -449,7 +483,7 @@ cuphydriver_api.cpp:1852-1866   只有 gpuCommEnabledViaCpu() 才排 "TaskDL2Rin
 
 #### 官方依據（DOCA 3.4.0 文件）
 
-這整套設定不是 Aerial 自創的 workaround，而是 NVIDIA 對本平台的**指定做法**：
+以下兩項核心要求不是 Aerial 自創的 workaround，而是 NVIDIA 對本平台的**指定做法**：NIC-visible queue / data memory 使用 CPU pinned memory，以及 TX 啟用 CPU proxy。
 
 > "Due to hardware topology limitations, **DGX Spark does not support GPUDirect RDMA**."
 >
@@ -473,11 +507,45 @@ cuphydriver_api.cpp:1852-1866   只有 gpuCommEnabledViaCpu() 才排 "TaskDL2Rin
 | Tx queue 同上 | `doca_eth_txq_gpu_set_sq_mem_type(..., DOCA_GPU_MEM_TYPE_CPU_GPU)`（`doca_obj.cpp:626`） |
 | **Tx 必須開 CPU proxy mode** | `doca_eth_txq_gpu_set_uar_on_cpu()`（`doca_obj.cpp:633`）+ 跳過 trigger kernel（`gpu_comm.cpp:465`）+ `doca_eth_txq_gpu_cpu_proxy_progress()`（`gpu_comm.cpp:318-323`） |
 
-**所以 3.4 節「doorbell 由 CPU 敲」不是 Aerial 的設計選擇，是這個平台上 DOCA 強制要求的。** 換句話說，`gpu_init_comms_via_cpu: 1` 在 Spark 上不是可調的效能選項，是唯一能動的組態。
+**所以 3.4 節「doorbell 由 CPU 敲」不是 Aerial 的設計選擇，是這個平台上 DOCA 的強制要求。**
 
-> ⚠️ 用詞注意：官方把 `DOCA_GPU_MEM_TYPE_CPU_GPU` 稱為 **CPU pinned memory**（另一處敘述則說「memory resides on the GPU and is accessible also by the CPU」，兩處說法不一致）。GB10 上 CPU/GPU coherent 共用實體記憶體，這個區別在效能上可能沒有實際意義，但對外描述時應以「CPU pinned memory」為準。
+但要區分兩個層次，別把話說得比證據更大：
 
-### 3.6 BFP-9 壓縮：`decompress_scale_blockFP` 的反向
+| | 誰規定的 |
+|---|---|
+| NIC-visible 記憶體必須是 CPU pinned、TX 必須用 CPU proxy | **DOCA / 平台強制**（官方文件如上） |
+| 保留一份 GPU-only 壓縮 buffer，另配 CPU pinned TX buffer 並做 D2H copy | **Aerial 的實作選擇**——DOCA 沒有規定要用這個雙 buffer pipeline |
+
+準確的說法是：**只要走 `gpu_init_comms_dl: 1` 的 DOCA GPUNetIO Ethernet TX 路徑，在 Spark 上就必須用 CPU pinned queue/data memory 與 CPU proxy；`gpu_init_comms_via_cpu: 0` 的 GPU 直接 doorbell 路徑不受平台支援。**
+
+這**不等於**「原始碼裡的全 CPU DPDK TX 組態（`cpu_init_comms: 1`，`fh.cpp:187-196`）已被證明不可運行」——那條路徑繞開 DOCA GPUNetIO，本文沒有在硬體上驗證過它能否滿足 Aerial 的 timing 與 throughput 要求。
+
+#### DOCA 記憶體型別的命名慣例
+
+命名規則是 **`<記憶體所在端>_<另一個可存取端>`**。官方 API Reference 定義三種：
+
+| enum | 記憶體實際在哪 | 誰能存取 |
+|---|---|---|
+| `DOCA_GPU_MEM_TYPE_GPU` | GPU | 只有 GPU |
+| `DOCA_GPU_MEM_TYPE_GPU_CPU` | **GPU** | GPU + CPU |
+| `DOCA_GPU_MEM_TYPE_CPU_GPU` | **CPU** | CPU + GPU |
+
+Spark 指定用的 `CPU_GPU` 就是「**記憶體在 CPU（pinned），GPU 也可存取**」——與 installation 頁說的「CPU pinned memory」完全一致，兩處說法沒有矛盾。
+
+> `GPU_CPU`（記憶體在 GPU、CPU 也能讀）是另一個型別，典型用途是 CPU 對 GPU 下通知（例如 CUDA kernel 輪詢 CPU 寫的 exit condition）。目前本 repo 的相關 source **沒有使用 `DOCA_GPU_MEM_TYPE_GPU_CPU`**；`peer.cpp:503` 的 RX semaphore 實際使用 `GPU` 作為 semaphore item memory、`CPU_GPU` 作為 custom-info memory，wrapper 分別傳給 `doca_gpu_semaphore_set_memory_type()` 與 `doca_gpu_semaphore_set_custom_info()`（`doca_obj.cpp:377, 397`）。
+
+#### UMA 不代表兩種 allocation 等價
+
+GB10 的 CPU 與 GPU 共用同一組實體 LPDDR5X，但**不能因此推論 `CPU_GPU` 與 GPU-only allocation 沒有差別**：
+
+- CUDA/DOCA 的 allocation type 仍決定 **CPU、GPU、NIC 三方各自的合法存取方式**。device allocator（`cudaMalloc` 一類）取得的記憶體，並不會因為實體共享就自動變成 CPU complex 或 PCIe NIC 可 coherent 存取的——這正是 Spark 不支援 GPUDirect RDMA、必須改用 CPU pinned memory 的原因。
+- **Aerial 自己就做了顯式搬移**：下行送包路徑用 `cudaMemcpyDeviceToHost` 把 GPU buffer 搬到 CPU pinned buffer（`gpu_comm.cpp:263-268`）。如果兩者真的等價，這個 copy 不會存在。
+
+所以正確的說法是：**實體記憶體共享，但存取權限、coherency 與 NIC 可見性仍由 allocation type 決定，顯式 copy 的成本是真實的**。
+
+（延伸閱讀：[DGX Spark CUDA Porting Guide](https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html)）
+
+### 3.6 BFP-9 壓縮：`decompress_scale_blockFP` 的配對 encoder
 
 - 啟動：`generic_cuda_kernels.cu:274` `launch_kernel_compression()`；`bit_width==9` 且全 cell 一致時特化成 `kernel_compress<9>`（`:308-311`），grid `(max_antennas, num_cells, 14)`、block `COMPRESSION_THREADS = 576`（`comp_kernel.cuh:22`）
 - kernel：`comp_kernel.cuh:25`，`comp_meth: 1` → `scale_compress_blockFP`（`:65`）
@@ -628,6 +696,8 @@ else          { offloads |= RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP; }   // CX7 無
 7. `rte_eth_tx_burst` 之後到封包真正離開網卡之間，是 mlx5 PMD + 硬體排程的行為，不在本 repo 內。
 
 ### 已知的程式碼瑕疵（實際讀到的）
+
+- **`doca_obj.cpp:372-377` 的註解與實際參數矛盾**：註解寫「Semaphore memory reside on CPU visibile from GPU」，但 `doca_gpu_semaphore_set_memory_type()` 收到的 `sem_mtype` 由呼叫端傳入，`peer.cpp:503` 傳的是 **`DOCA_GPU_MEM_TYPE_GPU`**（記憶體在 GPU、只有 GPU 可存取）。真正符合該註解描述的是下面 `:392-397` 的 custom-info（傳 `CPU_GPU`）。追這段時別信註解，看呼叫端傳什麼。
 
 - `Txq::~Txq`（`queue.cpp:99-105`）對 GPU queue 只取出 `gpu_` 指標，`// Destroy TXQ` 是空註解——GPU TXQ 沒有被真正銷毀。
 - `Nic::setup_tx_queues` / `setup_tx_queues_gpu`（`nic.cpp:419-421, 432-434`）宣告了 `txq_count_gpu`、`txq_size` 卻沒用到（dead code）。
