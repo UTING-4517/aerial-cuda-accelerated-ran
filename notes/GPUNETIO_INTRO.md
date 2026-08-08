@@ -64,7 +64,7 @@ pthread_setschedparam(thread_id, scheduling_policy, &scheduling_params);      //
 
 > ⚠️ **「GPU 可直接讀」不等於「全程同一塊記憶體」。** 這裡有兩塊不同的 buffer：NIC 寫入的 DOCA cyclic packet buffer（`order_cuda_kernels.cu:3608` 用 `doca_gpu_dev_eth_rxq_get_pkt_addr()` 取址），以及 order kernel 解壓縮後寫入的 PUSCH/PRACH/SRS IQ tensor（`:3735-3766` 選 buffer、`:3782-3795` 寫入）。省掉的是 **CPU 解析、CPU staging 與 H2D copy**，不是「完全沒有資料搬移」。
 
-省下的不只是那次複製。**更重要的是省掉 CPU 逐包解析 O-RAN header 的工作**：4 個 eAxC × 14 symbol，每 slot 數百個封包，每包都要拆 header、查 eAxC 表、算落點、BFP 解壓縮。CPU 做這個會吃掉整個 slot 預算。
+省下的不只是那次複製。**更重要的是省掉 CPU 逐包解析 O-RAN header 的工作**：4 個 eAxC × 14 symbol，每 slot 數百個封包，每包都要拆 header、查 eAxC 表、算落點、BFP 解壓縮。CPU 若逐包完成這些工作，會顯著侵蝕每個 slot 的持續吞吐與處理裕量。
 
 ---
 
@@ -425,7 +425,7 @@ if(is_gpu())
 ### ④ 「延遲來自 CPU 排程」— 來源變了
 
 新的延遲來源：
-- **kernel launch 開銷** → 所以有 CUDA graph（`enable_ul_cuphy_graphs: 1`）：PUSCH、PUCCH、PRACH 各自改用 graph processing mode（`phypusch_aggr.cpp:745`、`phypucch_aggr.cpp:328`、`phyprach_aggr.cpp:479`），把各 channel pipeline 內的 kernel 序列預錄後 replay。
+- **kernel launch 開銷** → 所以有 CUDA graph（`enable_ul_cuphy_graphs: 1`）：PUSCH、PUCCH、PRACH、SRS 各自改用 graph processing mode（`phypusch_aggr.cpp:745`、`phypucch_aggr.cpp:328`、`phyprach_aggr.cpp:479`、`physrs_aggr.cpp:537`），把各 channel pipeline 內的 kernel 序列預錄後 replay。
   > ⚠️ **這不代表整個 slot 錄成同一張 graph。** order receive kernel 不在裡面，它仍由 `order_entity.cpp:1387` 每個 slot 單獨 launch。
 - **SM 爭用** → 所以有 MPS 配額
 - **kernel 逾時** → `ul_order_timeout_gpu_ns: 3000000`（3 ms）
@@ -511,7 +511,7 @@ NVIDIA 官方文件明文寫著：
 >
 > — [GPUNetIO Installation and Setup](https://networking-docs.nvidia.com/doca/archive/3-4-0/gpunetio-installation-and-setup)
 
-> ⚠️ **文件版本與實際版本不一致。** 上面引的是 DOCA 3.4 archive（用來佐證平台限制），但 Aerial 26.1 的 DGX Spark software manifest 列的是 **DOCA 3.2.1**（included in cuBB container）、CUDA Toolkit 13.1.1、DPDK 22.11、**GDRCopy N/A**（`5GModel/aerial-cuda-accelerated-ran.pdf` 第 17 頁）。平台限制的敘述兩版一致，但 **API 行為、錯誤碼與 sample 細節請以 container 內實際的 headers/libraries 為準**。
+> ⚠️ **文件版本與實際版本不一致。** 上面引的是 DOCA 3.4 archive（用來佐證平台限制），但 Aerial 26.1 的 DGX Spark software manifest 列的是 **DOCA 3.2.1**（included in cuBB container）、CUDA Toolkit 13.1.1、DPDK 22.11、**GDRCopy N/A**（`5GModel/aerial-cuda-accelerated-ran.pdf` PDF 實體第 18 頁，文件印刷頁碼 14）。平台限制的敘述兩版一致，但 **API 行為、錯誤碼與 sample 細節請以 container 內實際的 headers/libraries 為準**。
 
 在 Aerial 裡，這一切由**一個設定旗標**打開：
 
@@ -531,13 +531,15 @@ gpu_init_comms_via_cpu: 1
 
 1. **沒開這個旗標會怎樣**：DOCA 會走 Spark 不支援的 GPU-memory / GPUDirect RDMA 路徑，queue 或 memory registration 失敗，程式 FATAL exit。這不是 bug，是平台限制。
 
-   > 本機（DGX Spark，Aerial 26.1）實測觀察到的是 `doca_mmap_start` 回 **EFAULT (`errno 14`)**。確切的失敗 API 與錯誤碼會隨 DOCA/driver 版本而異，**請以自己的 runtime log 為準**，不要把這個組合當成跨版本的必然結果。
+   > **本機實測**（2026-07-27；DOCA 3.2.1025 / ConnectX-7 `15b3:1021` / driver 590.48.01 / CUDA 13.1）：底層 MR 註冊失敗回 **EFAULT (`errno 14`)**——`Failed to register user memory. Got errno=UNKNOWN-errno14 (14)`，出自 DOCA 內部的 `linux_devx_adapter.cpp:247`（**不在本 repo**）——連鎖成 `doca_mmap_start()` 失敗 → `Failed to setup DOCA GPU RxQ #0 on NIC ...` → `l1_init` 丟 NIC registration error → FATAL exit。
+   >
+   > 確切的失敗 API 與錯誤碼會隨 DOCA/driver 版本而異，**請以自己的 runtime log 為準**，不要把這個組合當成跨版本的必然結果。除錯時要往前找**第一個** error，不能只看最後 throw 的那行。
 
 2. **收送兩個方向的代價不對稱**：
    - **接收**：只是換記憶體位置，**不多一次複製**
    - **發送**：每個 symbol 多一趟 GPU→CPU 的 D2H 搬移（`gpu_comm.cpp:236-278`），且 doorbell 由 CPU 敲
 
-3. **抄範例要小心**：網路上的 GPUNetIO 範例多半假設有獨立 GPU + GPUDirect RDMA，直接照抄會踩到上面那個 EFAULT。
+3. **抄範例要小心**：網路上的 GPUNetIO 範例多半假設有獨立 GPU + GPUDirect RDMA；在 DGX Spark 上直接照抄，可能走入不支援的 GPU-memory registration 路徑而啟動失敗。實際失敗 API 與錯誤碼依軟體版本而異。
 
 ---
 
