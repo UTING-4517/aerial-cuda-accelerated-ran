@@ -6,10 +6,21 @@
 
 | 文件 | 主題 | 適合什麼時候看 |
 |---|---|---|
-| [GPUNETIO_INTRO.md](GPUNETIO_INTRO.md) | **DOCA GPUNetIO 入門**（給有 DPDK / FlexRAN 背景的人）。DPDK 知識哪些還適用、要新建立的 5 個 GPU 概念、上行封包完整旅程、FlexRAN 直覺會誤導的地方、工具對照、術語速查 | 建立心智模型；不確定某個 GPU 名詞是什麼 |
+| [DPDK_ADVANCED.md](DPDK_ADVANCED.md) | **`rte_flow`、`SEND_ON_TIMESTAMP`、mlx5 PMD**。一般 DPDK 應用用不到、但 O-RAN fronthaul 必用的部分。含收不到封包的檢查順序 | 只用過 `rx_burst`/`tx_burst`；封包收不到要除錯 |
+| [GPUNETIO_INTRO.md](GPUNETIO_INTRO.md) | **DOCA GPUNetIO 入門**。DPDK 知識哪些還適用、要新建立的 5 個 GPU 概念、上行封包完整旅程、FlexRAN 直覺會誤導的地方、工具對照、術語速查 | 建立心智模型；不確定某個 GPU 名詞是什麼 |
 | [TX_PATH_CPLANE_UPLANE.md](TX_PATH_CPLANE_UPLANE.md) | **發送路徑完整拆解**。NIC 初始化 → C-plane 走 DPDK → U-plane DL 走 GPU。含 kernel 鏈、時序控制、無效參數清單、除錯用 log 字串 | 要改 code 或查某個設定實際做什麼 |
 
-閱讀順序：先 `GPUNETIO_INTRO.md` 建立概念，再依需要查 `TX_PATH_CPLANE_UPLANE.md`。
+**閱讀順序**：
+
+```
+DPDK_ADVANCED.md      ← 補齊 DPDK 這半（與 GPU 無關）
+        ↓
+GPUNETIO_INTRO.md     ← 補齊 GPU 那半，建立整體心智模型
+        ↓
+TX_PATH_CPLANE_UPLANE.md  ← 需要細節時再查
+```
+
+前兩份互相獨立，先看哪份都可以。但除錯「收不到封包」時，`DPDK_ADVANCED.md` §5 的檢查順序通常比 GPU 那半更快找到問題。
 
 ## 慣例
 

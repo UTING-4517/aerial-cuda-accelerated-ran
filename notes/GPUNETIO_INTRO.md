@@ -1,8 +1,10 @@
 # DOCA GPUNetIO 入門：給有 DPDK 背景的人
 
-**這份文件的定位**：假設你熟悉 DPDK / FlexRAN（lcore、mbuf、`rte_eth_rx_burst`、`rte_flow`），但沒有 GPU 開發經驗。目標是用你已知的東西當座標系，建立正確的 GPUNetIO 心智模型。
+**這份文件的定位**：假設你會用 DPDK 收送封包（`rte_eth_rx_burst` / `tx_burst`、mbuf），但沒有 GPU 開發經驗。目標是用你已知的東西當座標系，建立正確的 GPUNetIO 心智模型。
 
 **不需要**先懂 CUDA。需要用到的 GPU 概念都在第 3 節從頭解釋。
+
+**不需要**先懂 `rte_flow`。但它在 Aerial 裡很關鍵，補在 [`DPDK_ADVANCED.md`](DPDK_ADVANCED.md)。
 
 **對照的程式碼**：本 repo（NVIDIA Aerial cuBB），設定基準 `cuPHY-CP/cuphycontroller/config/cuphycontroller_F08_WNC_DGX.yaml`（DGX Spark / GB10 + 整合式 ConnectX-7）。所有行號都經過實際讀取確認。
 
@@ -54,22 +56,27 @@ sched_setaffinity(0, sizeof(cpu_affinity_mask), &cpu_affinity_mask);
 
 ---
 
-## 2. 好消息：你的 DPDK 知識大半直接適用
+## 2. DPDK 那一半：什麼還在、什麼要補
 
 **GPUNetIO 沒有取代 DPDK，它只接管了資料面。控制面全部還是 DPDK。**
 
-| 你熟悉的 | 在 Aerial 裡還在不在 | 位置 |
-|---|---|---|
-| `rte_eal_init()` + hugepage + PCI 綁定 | **完全一樣** | `aerial-fh-driver/lib/fronthaul.cpp:38-70` |
-| `rte_eth_dev_configure()` / MTU / offloads | **完全一樣** | `aerial-fh-driver/lib/nic.cpp:365-397` |
-| **`rte_flow` 規則** | **完全一樣，而且是核心** | `aerial-fh-driver/lib/peer.cpp:528-693` |
-| `rte_flow_isolate()` | **完全一樣** | `aerial-fh-driver/lib/nic.cpp:853-864` |
-| `rte_eth_tx_burst()` | **C-plane 還在用** | `aerial-fh-driver/lib/queue.cpp:122` |
-| mbuf / mempool | **C-plane 還在用** | `aerial-fh-driver/lib/nic.cpp:458-533` |
-| `RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP` | **完全一樣** | `aerial-fh-driver/lib/nic.cpp:374-384` |
-| mlx5 PMD devargs（`dv_flow_en=2` 等） | **完全一樣** | `aerial-fh-driver/lib/nic.cpp:242` |
+被換掉的**只有**：上行 U-plane 的 `rte_eth_rx_burst()`，以及下行 U-plane 的送出。其餘都還是 DPDK。
 
-被換掉的**只有**：上行 U-plane 的 `rte_eth_rx_burst()`，以及下行 U-plane 的送出。
+但「還是 DPDK」不代表「你一定用過」。O-RAN fronthaul 用到的 DPDK 功能比一般應用多：
+
+| DPDK 主題 | 一般 DPDK 應用會碰到嗎 | 在 Aerial 的重要性 | 位置 |
+|---|---|---|---|
+| `rte_eth_rx_burst` / `tx_burst` | ✅ 一定會 | C-plane 送出還在用；**上行收包已被 GPU 取代** | `aerial-fh-driver/lib/queue.cpp:122` |
+| mbuf / mempool | ✅ 一定會 | C-plane 用；上行收包不用 | `aerial-fh-driver/lib/nic.cpp:458-533` |
+| `rte_eal_init()` + hugepage | ✅ 一定會 | 不變 | `aerial-fh-driver/lib/fronthaul.cpp:38-70` |
+| `rte_eth_dev_configure()` | ✅ 常見 | 不變 | `aerial-fh-driver/lib/nic.cpp:366-398` |
+| **`rte_flow`** | ❌ 多數應用不用 | **最高**——上行封包能不能收到全看它 | `aerial-fh-driver/lib/peer.cpp:528-693` |
+| **`rte_flow_isolate()`** | ❌ 少見 | **高**——不符規則的封包靜默消失 | `aerial-fh-driver/lib/nic.cpp:854-865` |
+| **`SEND_ON_TIMESTAMP`** | ❌ 少見 | 高——O-RAN 時序靠它 | `aerial-fh-driver/lib/nic.cpp:374-384` |
+| **mlx5 PMD devargs** | ❌ 少見 | 中——影響 flow 引擎與 zero-copy | `aerial-fh-driver/lib/nic.cpp:239-251` |
+
+> **下半部那四項如果沒接觸過，先看 [`DPDK_ADVANCED.md`](DPDK_ADVANCED.md)。**
+> 它們跟 GPU 無關（就算不用 GPUNetIO，做 O-RAN fronthaul 一樣要用），但對除錯的重要性可能比 GPU 那半還高——收不到封包時，第一個要懷疑的是 flow rule 沒比中，不是 GPU。
 
 ### 兩者是縫在一起的
 
@@ -442,6 +449,7 @@ gpu_init_comms_via_cpu: 1
 - [GPUNetIO Sample Guide](https://docs.nvidia.com/doca/sdk/gpunetio-sample-guide/index.html)
 
 **本 repo 文件**
+- [`DPDK_ADVANCED.md`](DPDK_ADVANCED.md) — `rte_flow`、`SEND_ON_TIMESTAMP`、mlx5 PMD（與 GPU 無關但 Aerial 必用）
 - [`TX_PATH_CPLANE_UPLANE.md`](TX_PATH_CPLANE_UPLANE.md) — 發送路徑（C-plane DPDK + U-plane GPU）完整拆解
 - [`../5GModel/aerial-cuda-accelerated-ran.pdf`](../5GModel/aerial-cuda-accelerated-ran.pdf) — Aerial 官方文件
 
